@@ -532,7 +532,9 @@ fn convert(
         None
     };
     let child_parent_class: Option<&str> = own_class_label.as_deref().or(parent_class);
-    let semantic_here = is_semantic(&node.node_type);
+    // Recoverable syntax errors must survive semantic pruning so the core can
+    // choose a source-preserving review instead of declaring empty trees equal.
+    let semantic_here = node.node_type == "ERROR" || is_semantic(&node.node_type);
     let child_semantic_type = if semantic_here {
         Some(node.node_type.as_str())
     } else {
@@ -631,8 +633,9 @@ fn async_variant_of(node: tree_sitter::Node<'_>) -> Option<&'static str> {
 }
 
 fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
-    let children: Vec<CstNode> = (0..node.named_child_count())
-        .filter_map(|i| node.named_child(i))
+    let children: Vec<CstNode> = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .filter(|child| child.is_named() || child.is_error() || child.is_missing())
         .map(|child| node_to_cst(child, source))
         .collect();
 
@@ -649,9 +652,14 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
     };
 
     CstNode {
-        node_type: async_variant_of(node)
-            .map(str::to_string)
-            .unwrap_or_else(|| node.kind().to_string()),
+        // The existing SemanticNode contract has no missing-token flag. Use
+        // the shared ERROR marker while retaining its exact zero-width span.
+        node_type: if node.is_missing() {
+            "ERROR".to_string()
+        } else {
+            async_variant_of(node).map(str::to_string)
+                .unwrap_or_else(|| node.kind().to_string())
+        },
         named: node.is_named(),
         text,
         start_line: node.start_position().row as u32,
@@ -780,6 +788,54 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    fn has_error(node: &serde_json::Value) -> bool {
+        node["node_type"] == "ERROR" || node["children"].as_array()
+            .is_some_and(|children| children.iter().any(has_error))
+    }
+
+    #[test]
+    fn incomplete_syntax_preserves_error_evidence() {
+        for (language, filename, sources) in [
+            ("javascript", "a.js", vec!["function f(", "function g(", "function f() {", "const x = \"unfinished", "let x = (1 + 2;"]),
+            ("typescript", "a.ts", vec!["function f(", "function g(", "const x: = 1", "interface A { x:"]),
+            ("tsx", "a.tsx", vec!["function f(", "const x = <Panel>"]),
+        ] {
+            for source in sources {
+                let output = process_impl(source, language, filename);
+                let tree: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert!(has_error(&tree), "{filename}: {source:?}: {output}");
+                assert_eq!(output, process_impl(source, language, filename));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_token_keeps_zero_width_position_and_unique_ids() {
+        let tree: serde_json::Value = serde_json::from_str(
+            &process_impl("let x = (1 + 2;", "javascript", "a.js")).unwrap();
+        let mut stack = vec![&tree];
+        let mut ids = std::collections::HashSet::new();
+        let mut missing = false;
+        while let Some(node) = stack.pop() {
+            assert!(ids.insert(node["id"].as_str().unwrap()));
+            if node["node_type"] == "ERROR" && node["position"]["start_col"] == 14 {
+                assert_eq!(node["position"], serde_json::json!({
+                    "start_line":0,"end_line":0,"start_col":14,"end_col":14}));
+                missing = true;
+            }
+            if let Some(children) = node["children"].as_array() { stack.extend(children); }
+        }
+        assert!(missing, "missing closing parenthesis must retain its insertion point: {tree}");
+    }
+
+    #[test]
+    fn valid_recovery_and_trivia_do_not_invent_errors() {
+        for source in ["", "// comment only\n", "function f() {}", "const x = (1 + 2);", "function g(a: number): number { return a; }"] {
+            let tree: serde_json::Value = serde_json::from_str(&process_impl(source, "typescript", "a.ts")).unwrap();
+            assert!(!has_error(&tree), "{source}: {tree}");
+        }
+    }
 
     #[test]
     fn grammar_id_nonempty() {

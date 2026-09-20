@@ -1,0 +1,13 @@
+╭─── Semantic diff ────╮
+│ Old       old.js     │
+│ New       new.js     │
+│ Language  javascript │
+│ Changes   1          │
+╰──────────────────────╯
+
+                                                                                
+  Type           Description                                                    
+ ────────────────────────────────────────────────────────────────────────────── 
+  MODIFICATION   Source changed; semantic equivalence is unknown (source        
+                 fallback)                                                      
+                                                                                
