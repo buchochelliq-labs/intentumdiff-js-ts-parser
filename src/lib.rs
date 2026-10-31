@@ -228,7 +228,10 @@ fn is_signature_name_leaf(node_type: &str) -> bool {
 fn is_literal_evidence_leaf(node_type: &str) -> bool {
     matches!(
         node_type,
-        "string" | "string_fragment" | "template_string" | "number" | "regex"
+        // JSX text is actual rendered content, not formatting trivia. Omitting it
+        // erases <span>Alice</span> -> <span>AliceX</span> edits before Rust
+        // matching, which falsely certifies them as IGNORED_STYLE (#6).
+        "string" | "string_fragment" | "template_string" | "number" | "regex" | "jsx_text"
     )
 }
 
@@ -792,6 +795,54 @@ mod tests {
     fn has_error(node: &serde_json::Value) -> bool {
         node["node_type"] == "ERROR" || node["children"].as_array()
             .is_some_and(|children| children.iter().any(has_error))
+    }
+
+    fn find_jsx_text<'a>(node: &'a serde_json::Value, expected: &str) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == "jsx_text" && node["label"] == expected {
+            return Some(node);
+        }
+        node["children"].as_array()?.iter().find_map(|child| find_jsx_text(child, expected))
+    }
+
+    #[test]
+    fn jsx_text_edit_retains_original_utf8_byte_span_and_distinct_hash() {
+        for (language, filename) in [("javascript", "view.jsx"), ("tsx", "view.tsx")] {
+            let old = "export function Hello() {\n  return <span>Alïcë</span>;\n}\n";
+            let new = old.replace("Alïcë", "AlïcëX");
+            let old_tree: serde_json::Value = serde_json::from_str(
+                &process_impl(old, language, filename)).expect("old parser JSON");
+            let new_tree: serde_json::Value = serde_json::from_str(
+                &process_impl(&new, language, filename)).expect("new parser JSON");
+            let old_text = find_jsx_text(&old_tree, "Alïcë")
+                .unwrap_or_else(|| panic!("{filename}: missing old JSX text leaf: {old_tree}"));
+            let new_text = find_jsx_text(&new_tree, "AlïcëX")
+                .unwrap_or_else(|| panic!("{filename}: missing new JSX text leaf: {new_tree}"));
+            let col = old.lines().nth(1).unwrap().find("Alïcë").unwrap() as u64;
+            for (node, label) in [(old_text, "Alïcë"), (new_text, "AlïcëX")] {
+                assert_eq!(node["position"]["start_line"].as_u64(), Some(1), "{filename}");
+                assert_eq!(node["position"]["end_line"].as_u64(), Some(1), "{filename}");
+                assert_eq!(node["position"]["start_col"].as_u64(), Some(col), "{filename}");
+                assert_eq!(node["position"]["end_col"].as_u64(),
+                    Some(col + label.len() as u64), "{filename}");
+            }
+            assert_ne!(old_text["structural_hash"], new_text["structural_hash"],
+                "{filename}: a rendered text edit must change Rust structural evidence");
+        }
+    }
+
+    #[test]
+    fn jsx_nested_text_retained_separately_from_attributes_and_whitespace() {
+        for (language, filename) in [("javascript", "view.jsx"), ("tsx", "view.tsx")] {
+            let source = "const view = <section>\n  <h1>Hello World</h1>\n  <p title=\"greeting\">Alice</p>\n</section>;\n";
+            let tree: serde_json::Value = serde_json::from_str(
+                &process_impl(source, language, filename)).expect("parser JSON");
+            for label in ["Hello World", "Alice"] {
+                let node = find_jsx_text(&tree, label)
+                    .unwrap_or_else(|| panic!("{filename}: missing nested JSX text {label:?}: {tree}"));
+                let pos = &node["position"];
+                assert!(pos["end_col"].as_u64().unwrap() > pos["start_col"].as_u64().unwrap());
+            }
+        }
     }
 
     #[test]
