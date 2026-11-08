@@ -643,13 +643,9 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
         .collect();
 
     let text = if children.is_empty() {
-        Some(
-            node.utf8_text(source)
-                .unwrap_or("")
-                .chars()
-                .take(4096)
-                .collect(),
-        )
+        // This text feeds structural hashes; clipping a display-sized prefix
+        // makes meaningful suffix edits produce identical semantic trees.
+        Some(node.utf8_text(source).unwrap_or("").to_string())
     } else {
         None
     };
@@ -791,6 +787,113 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    fn find_literal<'a>(node: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == kind {
+            return Some(node);
+        }
+        node["children"]
+            .as_array()?
+            .iter()
+            .find_map(|child| find_literal(child, kind))
+    }
+
+    #[test]
+    fn long_literal_suffix_edits_change_semantic_hash() {
+        for (language, filename) in [
+            ("javascript", "a.js"),
+            ("typescript", "a.ts"),
+            ("tsx", "a.tsx"),
+        ] {
+            for delimiter in ['"', '`'] {
+                for length in [4095, 4096, 4097, 4200, 16384] {
+                    let prefix = "a".repeat(length);
+                    let old = format!("const value = {delimiter}{prefix}x{delimiter};\n");
+                    let new = format!("const value = {delimiter}{prefix}y{delimiter};\n");
+                    let old_tree: serde_json::Value =
+                        serde_json::from_str(&process_impl(&old, language, filename)).unwrap();
+                    let new_tree: serde_json::Value =
+                        serde_json::from_str(&process_impl(&new, language, filename)).unwrap();
+                    assert!(
+                        !has_error(&old_tree) && !has_error(&new_tree),
+                        "{filename}: valid long literal"
+                    );
+                    assert_ne!(old_tree["structural_hash"], new_tree["structural_hash"],
+                        "{filename}: suffix edit after {length} characters in {delimiter} literal must survive hashing");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_unicode_literal_keeps_full_leaf_text_and_byte_span() {
+        let payload = format!("{}x", "é🦀".repeat(2100));
+        for (language, filename) in [
+            ("javascript", "a.js"),
+            ("typescript", "a.ts"),
+            ("tsx", "a.tsx"),
+        ] {
+            for delimiter in ['"', '`'] {
+                let source = format!("const value = {delimiter}{payload}{delimiter};\n");
+                let cst = parse_source(&source, language, filename).unwrap();
+                let leaf = cst
+                    .walk()
+                    .find(|node| node.text.as_deref() == Some(payload.as_str()))
+                    .unwrap_or_else(|| {
+                        panic!("{filename}: complete Unicode literal text must reach the CST")
+                    });
+                assert_eq!(leaf.start_line, 0);
+                assert_eq!(leaf.end_line, 0);
+                assert_eq!(
+                    &source[leaf.start_col as usize..leaf.end_col as usize],
+                    payload
+                );
+                assert_eq!(leaf.end_col - leaf.start_col, payload.len() as u32);
+                let changed = source.replace(&payload, &format!("{}y", "é🦀".repeat(2100)));
+                let old_tree: serde_json::Value =
+                    serde_json::from_str(&process_impl(&source, language, filename)).unwrap();
+                let new_tree: serde_json::Value =
+                    serde_json::from_str(&process_impl(&changed, language, filename)).unwrap();
+                assert_ne!(
+                    old_tree["structural_hash"], new_tree["structural_hash"],
+                    "{filename}: Unicode suffix edit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_unchanged_literals_keep_deterministic_hashes_across_trivia() {
+        let payload = "x".repeat(4200);
+        for (language, filename) in [
+            ("javascript", "a.js"),
+            ("typescript", "a.ts"),
+            ("tsx", "a.tsx"),
+        ] {
+            for (delimiter, kind) in [('"', "string"), ('`', "template_string")] {
+                let source = format!("const value = {delimiter}{payload}{delimiter};\n");
+                let restyled =
+                    format!("// description\nconst value  =  {delimiter}{payload}{delimiter} ;\n");
+                let original_output = process_impl(&source, language, filename);
+                assert_eq!(
+                    original_output,
+                    process_impl(&source, language, filename),
+                    "{filename}: deterministic parse"
+                );
+                let original: serde_json::Value = serde_json::from_str(&original_output).unwrap();
+                let styled: serde_json::Value =
+                    serde_json::from_str(&process_impl(&restyled, language, filename)).unwrap();
+                assert!(!has_error(&original) && !has_error(&styled));
+                let original_literal =
+                    find_literal(&original, kind).expect("original literal node");
+                let styled_literal = find_literal(&styled, kind).expect("restyled literal node");
+                assert_eq!(
+                    original_literal["structural_hash"], styled_literal["structural_hash"],
+                    "{filename}: trivia outside an unchanged literal must not change its hash"
+                );
+            }
+        }
+    }
 
     fn has_error(node: &serde_json::Value) -> bool {
         node["node_type"] == "ERROR" || node["children"].as_array()
