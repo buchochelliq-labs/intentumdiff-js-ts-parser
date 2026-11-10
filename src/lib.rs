@@ -232,6 +232,11 @@ fn is_literal_evidence_leaf(node_type: &str) -> bool {
         // erases <span>Alice</span> -> <span>AliceX</span> edits before Rust
         // matching, which falsely certifies them as IGNORED_STYLE (#6).
         "string" | "string_fragment" | "template_string" | "number" | "regex" | "jsx_text"
+            // Keyword literals are values, not names: `disabled={true}` ->
+            // `disabled={false}` flips a button's interaction state. Without a
+            // leaf the only evidence was the enclosing node's hash, so the
+            // review could not say which value changed (#9).
+            | "true" | "false" | "null" | "undefined"
     )
 }
 
@@ -427,6 +432,26 @@ fn label_for(node: &CstNode) -> String {
                             return inner.text_or_empty().to_string();
                         }
                     }
+                }
+            }
+        }
+        // JSX attribute: the prop name is its identity (`disabled`, `aria:label`);
+        // the value stays in child evidence so a value edit is a modification of
+        // the same prop rather than an anonymous `jsx_attribute` swap (#9).
+        "jsx_attribute" => {
+            for child in &node.children {
+                match child.node_type.as_str() {
+                    "property_identifier" => return child.text_or_empty().to_string(),
+                    // `xlink:href`: the `:` token is anonymous and not in the CST.
+                    "jsx_namespace_name" => {
+                        return child
+                            .children
+                            .iter()
+                            .map(|part| part.text_or_empty())
+                            .collect::<Vec<_>>()
+                            .join(":");
+                    }
+                    _ => {}
                 }
             }
         }
@@ -946,6 +971,105 @@ mod tests {
                 assert!(pos["end_col"].as_u64().unwrap() > pos["start_col"].as_u64().unwrap());
             }
         }
+    }
+
+    fn find_node<'a>(
+        node: &'a serde_json::Value,
+        kind: &str,
+        label: &str,
+    ) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == kind && node["label"] == label {
+            return Some(node);
+        }
+        node["children"]
+            .as_array()?
+            .iter()
+            .find_map(|child| find_node(child, kind, label))
+    }
+
+    fn tree(source: &str, language: &str, filename: &str) -> serde_json::Value {
+        serde_json::from_str(&process_impl(source, language, filename)).expect("parser JSON")
+    }
+
+    #[test]
+    fn jsx_boolean_prop_value_edit_retains_value_leaf_under_named_prop() {
+        // Exact web-tsx-disabled_prop pair from #9.
+        let old = "export const Action = () => <button disabled={true}>Go</button>;\n";
+        let new = "export const Action = () => <button disabled={false}>Go</button>;\n";
+        for (language, filename) in [("javascript", "a.jsx"), ("tsx", "a.tsx")] {
+            let old_tree = tree(old, language, filename);
+            let new_tree = tree(new, language, filename);
+            let old_prop = find_node(&old_tree, "jsx_attribute", "disabled")
+                .unwrap_or_else(|| panic!("{filename}: prop named by attribute: {old_tree}"));
+            let new_prop = find_node(&new_tree, "jsx_attribute", "disabled")
+                .unwrap_or_else(|| panic!("{filename}: prop named by attribute: {new_tree}"));
+            let old_value = find_node(old_prop, "true", "true")
+                .unwrap_or_else(|| panic!("{filename}: old value leaf: {old_prop}"));
+            let new_value = find_node(new_prop, "false", "false")
+                .unwrap_or_else(|| panic!("{filename}: new value leaf: {new_prop}"));
+            let col = old.find("true").unwrap() as u64;
+            for (node, len) in [(old_value, 4u64), (new_value, 5u64)] {
+                assert_eq!(node["position"]["start_line"].as_u64(), Some(0));
+                assert_eq!(node["position"]["end_line"].as_u64(), Some(0));
+                assert_eq!(node["position"]["start_col"].as_u64(), Some(col), "{filename}");
+                assert_eq!(node["position"]["end_col"].as_u64(), Some(col + len), "{filename}");
+            }
+            assert_ne!(old_value["structural_hash"], new_value["structural_hash"]);
+            assert_ne!(old_prop["structural_hash"], new_prop["structural_hash"]);
+            assert_ne!(old_tree["structural_hash"], new_tree["structural_hash"]);
+        }
+    }
+
+    #[test]
+    fn jsx_boolean_prop_identity_and_spacing_keep_hashes() {
+        let old = "export const Action = () => <button disabled={true}>Go</button>;\n";
+        let spaced = "export const Action = () =>  <button disabled={ true }>Go</button>;\n";
+        for (language, filename) in [("javascript", "a.jsx"), ("tsx", "a.tsx")] {
+            let output = process_impl(old, language, filename);
+            assert_eq!(output, process_impl(old, language, filename), "{filename}: deterministic");
+            let original: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let restyled = tree(spaced, language, filename);
+            assert_eq!(
+                original["structural_hash"], restyled["structural_hash"],
+                "{filename}: whitespace inside an expression container is not a prop change"
+            );
+        }
+    }
+
+    #[test]
+    fn keyword_literal_values_are_retained_as_evidence() {
+        for (language, filename) in [
+            ("javascript", "a.js"),
+            ("typescript", "a.ts"),
+            ("tsx", "a.tsx"),
+        ] {
+            for (value, kind) in [
+                ("true", "true"),
+                ("false", "false"),
+                ("null", "null"),
+                ("undefined", "undefined"),
+            ] {
+                let source = format!("export function f() {{ return {value}; }}\n");
+                let parsed = tree(&source, language, filename);
+                find_node(&parsed, kind, value)
+                    .unwrap_or_else(|| panic!("{filename}: missing {value} leaf: {parsed}"));
+            }
+            let source = "const v = <Panel value={null} hidden={undefined} />;\n";
+            if language != "typescript" {
+                let parsed = tree(source, language, filename);
+                let value = find_node(&parsed, "jsx_attribute", "value").expect("value prop");
+                find_node(value, "null", "null").expect("null leaf under value prop");
+                let hidden = find_node(&parsed, "jsx_attribute", "hidden").expect("hidden prop");
+                find_node(hidden, "undefined", "undefined").expect("undefined leaf");
+            }
+        }
+    }
+
+    #[test]
+    fn jsx_namespaced_and_bare_attribute_names_label_the_prop() {
+        let parsed = tree("const v = <svg xlink:href=\"#a\"><input checked /></svg>;\n", "tsx", "a.tsx");
+        find_node(&parsed, "jsx_attribute", "xlink:href").unwrap_or_else(|| panic!("{parsed}"));
+        find_node(&parsed, "jsx_attribute", "checked").unwrap_or_else(|| panic!("{parsed}"));
     }
 
     #[test]
